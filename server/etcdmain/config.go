@@ -19,7 +19,6 @@ package etcdmain
 import (
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"runtime"
 
@@ -32,14 +31,9 @@ import (
 	"go.etcd.io/etcd/server/v3/etcdserver/api/rafthttp"
 
 	"go.uber.org/zap"
-	"sigs.k8s.io/yaml"
 )
 
 var (
-	proxyFlagOff      = "off"
-	proxyFlagReadonly = "readonly"
-	proxyFlagOn       = "on"
-
 	fallbackFlagExit  = "exit"
 	fallbackFlagProxy = "proxy"
 
@@ -63,22 +57,9 @@ var (
 	}
 )
 
-type configProxy struct {
-	ProxyFailureWaitMs     uint `json:"proxy-failure-wait"`
-	ProxyRefreshIntervalMs uint `json:"proxy-refresh-interval"`
-	ProxyDialTimeoutMs     uint `json:"proxy-dial-timeout"`
-	ProxyWriteTimeoutMs    uint `json:"proxy-write-timeout"`
-	ProxyReadTimeoutMs     uint `json:"proxy-read-timeout"`
-	Fallback               string
-	Proxy                  string
-	ProxyJSON              string `json:"proxy"`
-	FallbackJSON           string `json:"discovery-fallback"`
-}
-
 // config holds the config for a command line invocation of etcd
 type config struct {
 	ec           embed.Config
-	cp           configProxy
 	cf           configFlags
 	configFile   string
 	printVersion bool
@@ -90,20 +71,12 @@ type configFlags struct {
 	flagSet       *flag.FlagSet
 	clusterState  *flags.SelectiveStringValue
 	fallback      *flags.SelectiveStringValue
-	proxy         *flags.SelectiveStringValue
 	v2deprecation *flags.SelectiveStringsValue
 }
 
 func newConfig() *config {
 	cfg := &config{
-		ec: *embed.NewConfig(),
-		cp: configProxy{
-			Proxy:                  proxyFlagOff,
-			ProxyFailureWaitMs:     5000,
-			ProxyRefreshIntervalMs: 30000,
-			ProxyDialTimeoutMs:     1000,
-			ProxyWriteTimeoutMs:    5000,
-		},
+		ec:      *embed.NewConfig(),
 		ignored: ignored,
 	}
 	cfg.cf = configFlags{
@@ -113,16 +86,10 @@ func newConfig() *config {
 			embed.ClusterStateFlagExisting,
 		),
 		fallback: flags.NewSelectiveStringValue(
-			fallbackFlagProxy,
 			fallbackFlagExit,
-		),
-		proxy: flags.NewSelectiveStringValue(
-			proxyFlagOff,
-			proxyFlagReadonly,
-			proxyFlagOn,
+			fallbackFlagProxy,
 		),
 		v2deprecation: flags.NewSelectiveStringsValue(
-			string(cconfig.V2_DEPR_0_NOT_YET),
 			string(cconfig.V2_DEPR_1_WRITE_ONLY),
 			string(cconfig.V2_DEPR_1_WRITE_ONLY_DROP),
 			string(cconfig.V2_DEPR_2_GONE)),
@@ -186,10 +153,29 @@ func newConfig() *config {
 		"advertise-client-urls",
 		"List of this member's client URLs to advertise to the public.",
 	)
-	fs.StringVar(&cfg.ec.Durl, "discovery", cfg.ec.Durl, "Discovery URL used to bootstrap the cluster.")
+
+	fs.StringVar(&cfg.ec.Durl, "discovery", cfg.ec.Durl, "Discovery URL used to bootstrap the cluster for v2 discovery. Will be deprecated in v3.7, and be decommissioned in v3.8.")
 	fs.Var(cfg.cf.fallback, "discovery-fallback", fmt.Sprintf("Valid values include %q", cfg.cf.fallback.Valids()))
 
-	fs.StringVar(&cfg.ec.Dproxy, "discovery-proxy", cfg.ec.Dproxy, "HTTP proxy to use for traffic to discovery service.")
+	fs.Var(
+		flags.NewUniqueStringsValue(""),
+		"discovery-endpoints",
+		"V3 discovery: List of gRPC endpoints of the discovery service.",
+	)
+	fs.StringVar(&cfg.ec.DiscoveryCfg.Token, "discovery-token", "", "V3 discovery: discovery token for the etcd cluster to be bootstrapped.")
+	fs.DurationVar(&cfg.ec.DiscoveryCfg.DialTimeout, "discovery-dial-timeout", cfg.ec.DiscoveryCfg.DialTimeout, "V3 discovery: dial timeout for client connections.")
+	fs.DurationVar(&cfg.ec.DiscoveryCfg.RequestTimeout, "discovery-request-timeout", cfg.ec.DiscoveryCfg.RequestTimeout, "V3 discovery: timeout for discovery requests (excluding dial timeout).")
+	fs.DurationVar(&cfg.ec.DiscoveryCfg.KeepAliveTime, "discovery-keepalive-time", cfg.ec.DiscoveryCfg.KeepAliveTime, "V3 discovery: keepalive time for client connections.")
+	fs.DurationVar(&cfg.ec.DiscoveryCfg.KeepAliveTimeout, "discovery-keepalive-timeout", cfg.ec.DiscoveryCfg.KeepAliveTimeout, "V3 discovery: keepalive timeout for client connections.")
+	fs.BoolVar(&cfg.ec.DiscoveryCfg.Secure.InsecureTransport, "discovery-insecure-transport", true, "V3 discovery: disable transport security for client connections.")
+	fs.BoolVar(&cfg.ec.DiscoveryCfg.Secure.InsecureSkipVerify, "discovery-insecure-skip-tls-verify", false, "V3 discovery: skip server certificate verification (CAUTION: this option should be enabled only for testing purposes).")
+	fs.StringVar(&cfg.ec.DiscoveryCfg.Secure.Cert, "discovery-cert", "", "V3 discovery: identify secure client using this TLS certificate file.")
+	fs.StringVar(&cfg.ec.DiscoveryCfg.Secure.Key, "discovery-key", "", "V3 discovery: identify secure client using this TLS key file.")
+	fs.StringVar(&cfg.ec.DiscoveryCfg.Secure.Cacert, "discovery-cacert", "", "V3 discovery: verify certificates of TLS-enabled secure servers using this CA bundle.")
+	fs.StringVar(&cfg.ec.DiscoveryCfg.Auth.Username, "discovery-user", "", "V3 discovery: username[:password] for authentication (prompt if password is not supplied).")
+	fs.StringVar(&cfg.ec.DiscoveryCfg.Auth.Password, "discovery-password", "", "V3 discovery: password for authentication (if this option is used, --user option shouldn't include password).")
+
+	fs.StringVar(&cfg.ec.Dproxy, "discovery-proxy", cfg.ec.Dproxy, "HTTP proxy to use for traffic to discovery service. Will be deprecated in v3.7, and be decommissioned in v3.8.")
 	fs.StringVar(&cfg.ec.DNSCluster, "discovery-srv", cfg.ec.DNSCluster, "DNS domain used to bootstrap initial cluster.")
 	fs.StringVar(&cfg.ec.DNSClusterServiceName, "discovery-srv-name", cfg.ec.DNSClusterServiceName, "Service name to query when using DNS discovery.")
 	fs.StringVar(&cfg.ec.InitialCluster, "initial-cluster", cfg.ec.InitialCluster, "Initial cluster configuration for bootstrapping.")
@@ -200,17 +186,7 @@ func newConfig() *config {
 
 	fs.BoolVar(&cfg.ec.PreVote, "pre-vote", cfg.ec.PreVote, "Enable to run an additional Raft election phase.")
 
-	fs.BoolVar(&cfg.ec.EnableV2, "enable-v2", cfg.ec.EnableV2, "Accept etcd V2 client requests. Deprecated in v3.5. Will be decommission in v3.6.")
-	fs.StringVar(&cfg.ec.ExperimentalEnableV2V3, "experimental-enable-v2v3", cfg.ec.ExperimentalEnableV2V3, "v3 prefix for serving emulated v2 state. Deprecated in 3.5. Will be decommissioned in 3.6.")
-	fs.Var(cfg.cf.v2deprecation, "v2-deprecation", fmt.Sprintf("v2store deprecation stage: %q. ", cfg.cf.proxy.Valids()))
-
-	// proxy
-	fs.Var(cfg.cf.proxy, "proxy", fmt.Sprintf("Valid values include %q", cfg.cf.proxy.Valids()))
-	fs.UintVar(&cfg.cp.ProxyFailureWaitMs, "proxy-failure-wait", cfg.cp.ProxyFailureWaitMs, "Time (in milliseconds) an endpoint will be held in a failed state.")
-	fs.UintVar(&cfg.cp.ProxyRefreshIntervalMs, "proxy-refresh-interval", cfg.cp.ProxyRefreshIntervalMs, "Time (in milliseconds) of the endpoints refresh interval.")
-	fs.UintVar(&cfg.cp.ProxyDialTimeoutMs, "proxy-dial-timeout", cfg.cp.ProxyDialTimeoutMs, "Time (in milliseconds) for a dial to timeout.")
-	fs.UintVar(&cfg.cp.ProxyWriteTimeoutMs, "proxy-write-timeout", cfg.cp.ProxyWriteTimeoutMs, "Time (in milliseconds) for a write to timeout.")
-	fs.UintVar(&cfg.cp.ProxyReadTimeoutMs, "proxy-read-timeout", cfg.cp.ProxyReadTimeoutMs, "Time (in milliseconds) for a read to timeout.")
+	fs.Var(cfg.cf.v2deprecation, "v2-deprecation", fmt.Sprintf("v2store deprecation stage: %q. ", cfg.cf.v2deprecation.Valids()))
 
 	// security
 	fs.StringVar(&cfg.ec.ClientTLSInfo.CertFile, "cert-file", "", "Path to the client server TLS cert file.")
@@ -295,6 +271,7 @@ func newConfig() *config {
 	fs.BoolVar(&cfg.ec.ExperimentalTxnModeWriteWithSharedBuffer, "experimental-txn-mode-write-with-shared-buffer", true, "Enable the write transaction to use a shared buffer in its readonly check operations.")
 	fs.UintVar(&cfg.ec.ExperimentalBootstrapDefragThresholdMegabytes, "experimental-bootstrap-defrag-threshold-megabytes", 0, "Enable the defrag during etcd server bootstrap on condition that it will free at least the provided threshold of disk space. Needs to be set to non-zero value to take effect.")
 	fs.IntVar(&cfg.ec.ExperimentalMaxLearners, "experimental-max-learners", membership.DefaultMaxLearners, "Sets the maximum number of learners that can be available in the cluster membership.")
+	fs.DurationVar(&cfg.ec.ExperimentalWaitClusterReadyTimeout, "experimental-wait-cluster-ready-timeout", cfg.ec.ExperimentalWaitClusterReadyTimeout, "Maximum duration to wait for the cluster to be ready.")
 
 	// unsafe
 	fs.BoolVar(&cfg.ec.UnsafeNoFsync, "unsafe-no-fsync", false, "Disables fsync, unsafe, will cause data loss.")
@@ -360,11 +337,10 @@ func (cfg *config) parse(arguments []string) error {
 
 func (cfg *config) configFromCmdLine() error {
 	// user-specified logger is not setup yet, use this logger during flag parsing
-	lg, err := zap.NewProduction()
+	lg, err := logutil.CreateDefaultZapLogger(zap.InfoLevel)
 	if err != nil {
 		return err
 	}
-
 	verKey := "ETCD_VERSION"
 	if verVal := os.Getenv(verKey); verVal != "" {
 		// unset to avoid any possible side-effect.
@@ -397,6 +373,8 @@ func (cfg *config) configFromCmdLine() error {
 	cfg.ec.ACUrls = flags.UniqueURLsFromFlag(cfg.cf.flagSet, "advertise-client-urls")
 	cfg.ec.ListenMetricsUrls = flags.UniqueURLsFromFlag(cfg.cf.flagSet, "listen-metrics-urls")
 
+	cfg.ec.DiscoveryCfg.Endpoints = flags.UniqueStringsFromFlag(cfg.cf.flagSet, "discovery-endpoints")
+
 	cfg.ec.CORS = flags.UniqueURLsMapFromFlag(cfg.cf.flagSet, "cors")
 	cfg.ec.HostWhitelist = flags.UniqueStringsMapFromFlag(cfg.cf.flagSet, "host-whitelist")
 
@@ -405,19 +383,17 @@ func (cfg *config) configFromCmdLine() error {
 	cfg.ec.LogOutputs = flags.UniqueStringsFromFlag(cfg.cf.flagSet, "log-outputs")
 
 	cfg.ec.ClusterState = cfg.cf.clusterState.String()
-	cfg.cp.Fallback = cfg.cf.fallback.String()
-	cfg.cp.Proxy = cfg.cf.proxy.String()
 
 	cfg.ec.V2Deprecation = cconfig.V2DeprecationEnum(cfg.cf.v2deprecation.String())
 
 	// disable default advertise-client-urls if lcurls is set
 	missingAC := flags.IsSet(cfg.cf.flagSet, "listen-client-urls") && !flags.IsSet(cfg.cf.flagSet, "advertise-client-urls")
-	if !cfg.mayBeProxy() && missingAC {
+	if missingAC {
 		cfg.ec.ACUrls = nil
 	}
 
 	// disable default initial-cluster if discovery is set
-	if (cfg.ec.Durl != "" || cfg.ec.DNSCluster != "" || cfg.ec.DNSClusterServiceName != "") && !flags.IsSet(cfg.cf.flagSet, "initial-cluster") {
+	if (cfg.ec.Durl != "" || cfg.ec.DNSCluster != "" || cfg.ec.DNSClusterServiceName != "" || len(cfg.ec.DiscoveryCfg.Endpoints) > 0) && !flags.IsSet(cfg.cf.flagSet, "initial-cluster") {
 		cfg.ec.InitialCluster = ""
 	}
 
@@ -431,45 +407,12 @@ func (cfg *config) configFromFile(path string) error {
 	}
 	cfg.ec = *eCfg
 
-	// load extra config information
-	b, rerr := os.ReadFile(path)
-	if rerr != nil {
-		return rerr
-	}
-	if yerr := yaml.Unmarshal(b, &cfg.cp); yerr != nil {
-		return yerr
-	}
-
-	if cfg.cp.FallbackJSON != "" {
-		if err := cfg.cf.fallback.Set(cfg.cp.FallbackJSON); err != nil {
-			log.Fatalf("unexpected error setting up discovery-fallback flag: %v", err)
-		}
-		cfg.cp.Fallback = cfg.cf.fallback.String()
-	}
-
-	if cfg.cp.ProxyJSON != "" {
-		if err := cfg.cf.proxy.Set(cfg.cp.ProxyJSON); err != nil {
-			log.Fatalf("unexpected error setting up proxyFlag: %v", err)
-		}
-		cfg.cp.Proxy = cfg.cf.proxy.String()
-	}
 	return nil
 }
 
-func (cfg *config) mayBeProxy() bool {
-	mayFallbackToProxy := cfg.ec.Durl != "" && cfg.cp.Fallback == fallbackFlagProxy
-	return cfg.cp.Proxy != proxyFlagOff || mayFallbackToProxy
-}
-
 func (cfg *config) validate() error {
-	err := cfg.ec.Validate()
-	// TODO(yichengq): check this for joining through discovery service case
-	if err == embed.ErrUnsetAdvertiseClientURLsFlag && cfg.mayBeProxy() {
-		return nil
+	if cfg.cf.fallback.String() == fallbackFlagProxy {
+		return fmt.Errorf("v2 proxy is deprecated, and --discovery-fallback can't be configured as %q", fallbackFlagProxy)
 	}
-	return err
+	return cfg.ec.Validate()
 }
-
-func (cfg config) isProxy() bool               { return cfg.cf.proxy.String() != proxyFlagOff }
-func (cfg config) isReadonlyProxy() bool       { return cfg.cf.proxy.String() == proxyFlagReadonly }
-func (cfg config) shouldFallbackToProxy() bool { return cfg.cf.fallback.String() == fallbackFlagProxy }

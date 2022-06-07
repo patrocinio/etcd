@@ -26,6 +26,7 @@ import (
 	"go.etcd.io/etcd/server/v3/storage/backend"
 	betesting "go.etcd.io/etcd/server/v3/storage/backend/testing"
 	"go.etcd.io/etcd/server/v3/storage/schema"
+	"go.uber.org/zap/zaptest"
 )
 
 func TestBackendClose(t *testing.T) {
@@ -71,7 +72,7 @@ func TestBackendSnapshot(t *testing.T) {
 	assert.NoError(t, f.Close())
 
 	// bootstrap new backend from the snapshot
-	bcfg := backend.DefaultBackendConfig()
+	bcfg := backend.DefaultBackendConfig(zaptest.NewLogger(t))
 	bcfg.Path, bcfg.BatchInterval, bcfg.BatchLimit = f.Name(), time.Hour, 10000
 	nb := backend.New(bcfg)
 	defer betesting.Close(t, nb)
@@ -122,7 +123,17 @@ func TestBackendBatchIntervalCommit(t *testing.T) {
 }
 
 func TestBackendDefrag(t *testing.T) {
-	b, _ := betesting.NewDefaultTmpBackend(t)
+	bcfg := backend.DefaultBackendConfig(zaptest.NewLogger(t))
+	// Make sure we change BackendFreelistType
+	// The goal is to verify that we restore config option after defrag.
+	if bcfg.BackendFreelistType == bolt.FreelistMapType {
+		bcfg.BackendFreelistType = bolt.FreelistArrayType
+	} else {
+		bcfg.BackendFreelistType = bolt.FreelistMapType
+	}
+
+	b, _ := betesting.NewTmpBackendFromCfg(t, bcfg)
+
 	defer betesting.Close(t, b)
 
 	tx := b.BatchTx()
@@ -167,6 +178,10 @@ func TestBackendDefrag(t *testing.T) {
 	nsize := b.Size()
 	if nsize >= size {
 		t.Errorf("new size = %v, want < %d", nsize, size)
+	}
+	db := backend.DbFromBackendForTest(b)
+	if db.FreelistType != bcfg.BackendFreelistType {
+		t.Errorf("db FreelistType = [%v], want [%v]", db.FreelistType, bcfg.BackendFreelistType)
 	}
 
 	// try put more keys after shrink.

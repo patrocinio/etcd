@@ -53,7 +53,7 @@ func MustFetchNotEmptyMetric(tb testing.TB, member *integration.Member, metric s
 func TestV3WatchRestoreSnapshotUnsync(t *testing.T) {
 	integration.BeforeTest(t)
 
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{
+	clus := integration.NewCluster(t, &integration.ClusterConfig{
 		Size:                   3,
 		SnapshotCount:          10,
 		SnapshotCatchUpEntries: 5,
@@ -81,7 +81,7 @@ func TestV3WatchRestoreSnapshotUnsync(t *testing.T) {
 
 	clus.Members[0].InjectPartition(t, clus.Members[1:]...)
 	initialLead := clus.WaitMembersForLeader(t, clus.Members[1:])
-	t.Logf("elected lead: %v", clus.Members[initialLead].Server.ID())
+	t.Logf("elected lead: %v", clus.Members[initialLead].Server.MemberId())
 	t.Logf("sleeping for 2 seconds")
 	time.Sleep(2 * time.Second)
 	t.Logf("sleeping for 2 seconds DONE")

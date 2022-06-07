@@ -18,14 +18,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
-	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coreos/go-semver/semver"
 	"go.etcd.io/etcd/pkg/v3/pbutil"
 	"go.etcd.io/etcd/server/v3/etcdserver/api"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/membership"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/v2store"
+	"go.etcd.io/etcd/server/v3/etcdserver/errors"
+	"go.etcd.io/etcd/server/v3/etcdserver/txn"
 
 	"go.uber.org/zap"
 )
@@ -123,9 +125,13 @@ func (s *EtcdServer) applyV2Request(r *RequestV2, shouldApplyV3 membership.Shoul
 		alternative: func() string { return fmt.Sprintf("id:%d,method:%s,path:%s", r.ID, r.Method, r.Path) },
 	}
 	defer func(start time.Time) {
+		if !utf8.ValidString(r.Method) {
+			s.lg.Info("method is not valid utf-8")
+			return
+		}
 		success := resp.Err == nil
-		applySec.WithLabelValues(v2Version, r.Method, strconv.FormatBool(success)).Observe(time.Since(start).Seconds())
-		warnOfExpensiveRequest(s.Logger(), s.Cfg.WarningApplyDuration, start, stringer, nil, nil)
+		txn.ApplySecObserve(v2Version, r.Method, success, time.Since(start))
+		txn.WarnOfExpensiveRequest(s.Logger(), s.Cfg.WarningApplyDuration, start, stringer, nil, nil)
 	}(time.Now())
 
 	switch r.Method {
@@ -141,7 +147,7 @@ func (s *EtcdServer) applyV2Request(r *RequestV2, shouldApplyV3 membership.Shoul
 		return s.applyV2.Sync(r)
 	default:
 		// This should never be reached, but just in case:
-		return Response{Err: ErrUnknownMethod}
+		return Response{Err: errors.ErrUnknownMethod}
 	}
 }
 

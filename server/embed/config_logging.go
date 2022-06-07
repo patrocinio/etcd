@@ -201,7 +201,7 @@ func (cfg *Config) setupLogging() error {
 	return nil
 }
 
-// NewZapLoggerBuilder generates a zap logger builder that sets given loger
+// NewZapLoggerBuilder generates a zap logger builder that sets given logger
 // for embedded etcd.
 func NewZapLoggerBuilder(lg *zap.Logger) func(*Config) error {
 	return func(cfg *Config) error {
@@ -269,9 +269,9 @@ func setupLogRotation(logOutputs []string, logRotateConfigJSON string) error {
 		var syntaxError *json.SyntaxError
 		switch {
 		case errors.As(err, &syntaxError):
-			return fmt.Errorf("improperly formatted log rotation config: %w", err)
+			return fmt.Errorf("improperly formatted log rotation config: %v", err)
 		case errors.As(err, &unmarshalTypeError):
-			return fmt.Errorf("invalid log rotation config: %w", err)
+			return fmt.Errorf("invalid log rotation config: %v", err)
 		}
 	}
 	zap.RegisterSink("rotate", func(u *url.URL) (zap.Sink, error) {

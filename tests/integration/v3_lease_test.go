@@ -16,7 +16,9 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -37,7 +39,7 @@ import (
 func TestV3LeasePromote(t *testing.T) {
 	integration.BeforeTest(t)
 
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3, UseBridge: true})
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 3, UseBridge: true})
 	defer clus.Terminate(t)
 
 	// create lease
@@ -98,7 +100,7 @@ func TestV3LeasePromote(t *testing.T) {
 // TestV3LeaseRevoke ensures a key is deleted once its lease is revoked.
 func TestV3LeaseRevoke(t *testing.T) {
 	integration.BeforeTest(t)
-	testLeaseRemoveLeasedKey(t, func(clus *integration.ClusterV3, leaseID int64) error {
+	testLeaseRemoveLeasedKey(t, func(clus *integration.Cluster, leaseID int64) error {
 		lc := integration.ToGRPC(clus.RandClient()).Lease
 		_, err := lc.LeaseRevoke(context.TODO(), &pb.LeaseRevokeRequest{ID: leaseID})
 		return err
@@ -108,7 +110,7 @@ func TestV3LeaseRevoke(t *testing.T) {
 // TestV3LeaseGrantById ensures leases may be created by a given id.
 func TestV3LeaseGrantByID(t *testing.T) {
 	integration.BeforeTest(t)
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 3})
 	defer clus.Terminate(t)
 
 	// create fixed lease
@@ -142,10 +144,95 @@ func TestV3LeaseGrantByID(t *testing.T) {
 	}
 }
 
+// TestV3LeaseNegativeID ensures restarted member lessor can recover negative leaseID from backend.
+//
+// When the negative leaseID is used for lease revoke, all etcd nodes will remove the lease
+// and delete associated keys to ensure kv store data consistency
+//
+// It ensures issue 12535 is fixed by PR 13676
+func TestV3LeaseNegativeID(t *testing.T) {
+	tcs := []struct {
+		leaseID int64
+		k       []byte
+		v       []byte
+	}{
+		{
+			leaseID: -1, // int64 -1 is 2^64 -1 in uint64
+			k:       []byte("foo"),
+			v:       []byte("bar"),
+		},
+		{
+			leaseID: math.MaxInt64,
+			k:       []byte("bar"),
+			v:       []byte("foo"),
+		},
+		{
+			leaseID: math.MinInt64,
+			k:       []byte("hello"),
+			v:       []byte("world"),
+		},
+	}
+	for _, tc := range tcs {
+		t.Run(fmt.Sprintf("test with lease ID %16x", tc.leaseID), func(t *testing.T) {
+			integration.BeforeTest(t)
+			clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 3})
+			defer clus.Terminate(t)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cc := clus.RandClient()
+			lresp, err := integration.ToGRPC(cc).Lease.LeaseGrant(ctx, &pb.LeaseGrantRequest{ID: tc.leaseID, TTL: 300})
+			if err != nil {
+				t.Errorf("could not create lease %d (%v)", tc.leaseID, err)
+			}
+			if lresp.ID != tc.leaseID {
+				t.Errorf("got id %v, wanted id %v", lresp.ID, tc.leaseID)
+			}
+			putr := &pb.PutRequest{Key: tc.k, Value: tc.v, Lease: tc.leaseID}
+			_, err = integration.ToGRPC(cc).KV.Put(ctx, putr)
+			if err != nil {
+				t.Errorf("couldn't put key (%v)", err)
+			}
+
+			// wait for backend Commit
+			time.Sleep(100 * time.Millisecond)
+			// restore lessor from db file
+			clus.Members[2].Stop(t)
+			if err := clus.Members[2].Restart(t); err != nil {
+				t.Fatal(err)
+			}
+
+			// revoke lease should remove key
+			integration.WaitClientV3(t, clus.Members[2].Client)
+			_, err = integration.ToGRPC(clus.RandClient()).Lease.LeaseRevoke(ctx, &pb.LeaseRevokeRequest{ID: tc.leaseID})
+			if err != nil {
+				t.Errorf("could not revoke lease %d (%v)", tc.leaseID, err)
+			}
+			var revision int64
+			for _, m := range clus.Members {
+				getr := &pb.RangeRequest{Key: tc.k}
+				getresp, err := integration.ToGRPC(m.Client).KV.Range(ctx, getr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if revision == 0 {
+					revision = getresp.Header.Revision
+				}
+				if revision != getresp.Header.Revision {
+					t.Errorf("expect revision %d, but got %d", revision, getresp.Header.Revision)
+				}
+				if len(getresp.Kvs) != 0 {
+					t.Errorf("lease removed but key remains")
+				}
+			}
+		})
+	}
+}
+
 // TestV3LeaseExpire ensures a key is deleted once a key expires.
 func TestV3LeaseExpire(t *testing.T) {
 	integration.BeforeTest(t)
-	testLeaseRemoveLeasedKey(t, func(clus *integration.ClusterV3, leaseID int64) error {
+	testLeaseRemoveLeasedKey(t, func(clus *integration.Cluster, leaseID int64) error {
 		// let lease lapse; wait for deleted key
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -197,7 +284,7 @@ func TestV3LeaseExpire(t *testing.T) {
 // TestV3LeaseKeepAlive ensures keepalive keeps the lease alive.
 func TestV3LeaseKeepAlive(t *testing.T) {
 	integration.BeforeTest(t)
-	testLeaseRemoveLeasedKey(t, func(clus *integration.ClusterV3, leaseID int64) error {
+	testLeaseRemoveLeasedKey(t, func(clus *integration.Cluster, leaseID int64) error {
 		lc := integration.ToGRPC(clus.RandClient()).Lease
 		lreq := &pb.LeaseKeepAliveRequest{ID: leaseID}
 		ctx, cancel := context.WithCancel(context.Background())
@@ -284,7 +371,7 @@ func TestV3LeaseCheckpoint(t *testing.T) {
 				EnableLeaseCheckpoint:   tc.checkpointingEnabled,
 				LeaseCheckpointInterval: tc.checkpointingInterval,
 			}
-			clus := integration.NewClusterV3(t, config)
+			clus := integration.NewCluster(t, config)
 			defer clus.Terminate(t)
 
 			// create lease
@@ -325,8 +412,8 @@ func TestV3LeaseCheckpoint(t *testing.T) {
 				}
 			}
 
-			if tc.expectTTLIsGT != 0 && time.Duration(ttlresp.TTL)*time.Second <= tc.expectTTLIsGT {
-				t.Errorf("Expected lease ttl (%v) to be greather than (%v)", time.Duration(ttlresp.TTL)*time.Second, tc.expectTTLIsGT)
+			if tc.expectTTLIsGT != 0 && time.Duration(ttlresp.TTL)*time.Second < tc.expectTTLIsGT {
+				t.Errorf("Expected lease ttl (%v) to be >= than (%v)", time.Duration(ttlresp.TTL)*time.Second, tc.expectTTLIsGT)
 			}
 
 			if tc.expectTTLIsLT != 0 && time.Duration(ttlresp.TTL)*time.Second > tc.expectTTLIsLT {
@@ -339,7 +426,7 @@ func TestV3LeaseCheckpoint(t *testing.T) {
 // TestV3LeaseExists creates a lease on a random client and confirms it exists in the cluster.
 func TestV3LeaseExists(t *testing.T) {
 	integration.BeforeTest(t)
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 3})
 	defer clus.Terminate(t)
 
 	// create lease
@@ -363,7 +450,7 @@ func TestV3LeaseExists(t *testing.T) {
 // TestV3LeaseLeases creates leases and confirms list RPC fetches created ones.
 func TestV3LeaseLeases(t *testing.T) {
 	integration.BeforeTest(t)
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 1})
 	defer clus.Terminate(t)
 
 	ctx0, cancel0 := context.WithCancel(context.Background())
@@ -401,32 +488,56 @@ func TestV3LeaseLeases(t *testing.T) {
 // it was oberserved that the immediate lease renewal after granting a lease from follower resulted lease not found.
 // related issue https://github.com/etcd-io/etcd/issues/6978
 func TestV3LeaseRenewStress(t *testing.T) {
-	testLeaseStress(t, stressLeaseRenew)
+	testLeaseStress(t, stressLeaseRenew, false)
+}
+
+// TestV3LeaseRenewStressWithClusterClient is similar to TestV3LeaseRenewStress,
+// but it uses a cluster client instead of a specific member's client.
+// The related issue is https://github.com/etcd-io/etcd/issues/13675.
+func TestV3LeaseRenewStressWithClusterClient(t *testing.T) {
+	testLeaseStress(t, stressLeaseRenew, true)
 }
 
 // TestV3LeaseTimeToLiveStress keeps creating lease and retrieving it immediately to ensure the lease can be retrieved.
 // it was oberserved that the immediate lease retrieval after granting a lease from follower resulted lease not found.
 // related issue https://github.com/etcd-io/etcd/issues/6978
 func TestV3LeaseTimeToLiveStress(t *testing.T) {
-	testLeaseStress(t, stressLeaseTimeToLive)
+	testLeaseStress(t, stressLeaseTimeToLive, false)
 }
 
-func testLeaseStress(t *testing.T, stresser func(context.Context, pb.LeaseClient) error) {
+// TestV3LeaseTimeToLiveStressWithClusterClient is similar to TestV3LeaseTimeToLiveStress,
+// but it uses a cluster client instead of a specific member's client.
+// The related issue is https://github.com/etcd-io/etcd/issues/13675.
+func TestV3LeaseTimeToLiveStressWithClusterClient(t *testing.T) {
+	testLeaseStress(t, stressLeaseTimeToLive, true)
+}
+
+func testLeaseStress(t *testing.T, stresser func(context.Context, pb.LeaseClient) error, useClusterClient bool) {
 	integration.BeforeTest(t)
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 3})
 	defer clus.Terminate(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	errc := make(chan error)
 
-	for i := 0; i < 30; i++ {
-		for j := 0; j < 3; j++ {
-			go func(i int) { errc <- stresser(ctx, integration.ToGRPC(clus.Client(i)).Lease) }(j)
+	if useClusterClient {
+		for i := 0; i < 300; i++ {
+			clusterClient, err := clus.ClusterClient()
+			if err != nil {
+				t.Fatal(err)
+			}
+			go func(i int) { errc <- stresser(ctx, integration.ToGRPC(clusterClient).Lease) }(i)
+		}
+	} else {
+		for i := 0; i < 100; i++ {
+			for j := 0; j < 3; j++ {
+				go func(i int) { errc <- stresser(ctx, integration.ToGRPC(clus.Client(i)).Lease) }(j)
+			}
 		}
 	}
 
-	for i := 0; i < 90; i++ {
+	for i := 0; i < 300; i++ {
 		if err := <-errc; err != nil {
 			t.Fatal(err)
 		}
@@ -457,7 +568,7 @@ func stressLeaseRenew(tctx context.Context, lc pb.LeaseClient) (reterr error) {
 			continue
 		}
 		if rresp.TTL == 0 {
-			return fmt.Errorf("TTL shouldn't be 0 so soon")
+			return errors.New("TTL shouldn't be 0 so soon")
 		}
 	}
 	return nil
@@ -484,7 +595,7 @@ func stressLeaseTimeToLive(tctx context.Context, lc pb.LeaseClient) (reterr erro
 
 func TestV3PutOnNonExistLease(t *testing.T) {
 	integration.BeforeTest(t)
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 1})
 	defer clus.Terminate(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -502,7 +613,7 @@ func TestV3PutOnNonExistLease(t *testing.T) {
 // related issue https://github.com/etcd-io/etcd/issues/6537
 func TestV3GetNonExistLease(t *testing.T) {
 	integration.BeforeTest(t)
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 3})
 	defer clus.Terminate(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -522,12 +633,12 @@ func TestV3GetNonExistLease(t *testing.T) {
 		Keys: true,
 	}
 
-	for _, client := range clus.Clients {
+	for _, m := range clus.Members {
 		// quorum-read to ensure revoke completes before TimeToLive
-		if _, err := integration.ToGRPC(client).KV.Range(ctx, &pb.RangeRequest{Key: []byte("_")}); err != nil {
+		if _, err := integration.ToGRPC(m.Client).KV.Range(ctx, &pb.RangeRequest{Key: []byte("_")}); err != nil {
 			t.Fatal(err)
 		}
-		resp, err := integration.ToGRPC(client).Lease.LeaseTimeToLive(ctx, leaseTTLr)
+		resp, err := integration.ToGRPC(m.Client).Lease.LeaseTimeToLive(ctx, leaseTTLr)
 		if err != nil {
 			t.Fatalf("expected non nil error, but go %v", err)
 		}
@@ -540,7 +651,7 @@ func TestV3GetNonExistLease(t *testing.T) {
 // TestV3LeaseSwitch tests a key can be switched from one lease to another.
 func TestV3LeaseSwitch(t *testing.T) {
 	integration.BeforeTest(t)
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 3})
 	defer clus.Terminate(t)
 
 	key := "foo"
@@ -603,7 +714,7 @@ func TestV3LeaseSwitch(t *testing.T) {
 func TestV3LeaseFailover(t *testing.T) {
 	integration.BeforeTest(t)
 
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 3})
 	defer clus.Terminate(t)
 
 	toIsolate := clus.WaitMembersForLeader(t, clus.Members)
@@ -664,7 +775,7 @@ func TestV3LeaseFailover(t *testing.T) {
 func TestV3LeaseRequireLeader(t *testing.T) {
 	integration.BeforeTest(t)
 
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 3})
 	defer clus.Terminate(t)
 
 	lc := integration.ToGRPC(clus.Client(0)).Lease
@@ -704,7 +815,7 @@ const fiveMinTTL int64 = 300
 func TestV3LeaseRecoverAndRevoke(t *testing.T) {
 	integration.BeforeTest(t)
 
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1, UseBridge: true})
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 1, UseBridge: true})
 	defer clus.Terminate(t)
 
 	kvc := integration.ToGRPC(clus.Client(0)).KV
@@ -755,7 +866,7 @@ func TestV3LeaseRecoverAndRevoke(t *testing.T) {
 func TestV3LeaseRevokeAndRecover(t *testing.T) {
 	integration.BeforeTest(t)
 
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1, UseBridge: true})
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 1, UseBridge: true})
 	defer clus.Terminate(t)
 
 	kvc := integration.ToGRPC(clus.Client(0)).KV
@@ -807,7 +918,7 @@ func TestV3LeaseRevokeAndRecover(t *testing.T) {
 func TestV3LeaseRecoverKeyWithDetachedLease(t *testing.T) {
 	integration.BeforeTest(t)
 
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1, UseBridge: true})
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 1, UseBridge: true})
 	defer clus.Terminate(t)
 
 	kvc := integration.ToGRPC(clus.Client(0)).KV
@@ -863,7 +974,7 @@ func TestV3LeaseRecoverKeyWithDetachedLease(t *testing.T) {
 func TestV3LeaseRecoverKeyWithMutipleLease(t *testing.T) {
 	integration.BeforeTest(t)
 
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1, UseBridge: true})
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 1, UseBridge: true})
 	defer clus.Terminate(t)
 
 	kvc := integration.ToGRPC(clus.Client(0)).KV
@@ -935,7 +1046,7 @@ func TestV3LeaseRecoverKeyWithMutipleLease(t *testing.T) {
 }
 
 // acquireLeaseAndKey creates a new lease and creates an attached key.
-func acquireLeaseAndKey(clus *integration.ClusterV3, key string) (int64, error) {
+func acquireLeaseAndKey(clus *integration.Cluster, key string) (int64, error) {
 	// create lease
 	lresp, err := integration.ToGRPC(clus.RandClient()).Lease.LeaseGrant(
 		context.TODO(),
@@ -956,8 +1067,8 @@ func acquireLeaseAndKey(clus *integration.ClusterV3, key string) (int64, error) 
 
 // testLeaseRemoveLeasedKey performs some action while holding a lease with an
 // attached key "foo", then confirms the key is gone.
-func testLeaseRemoveLeasedKey(t *testing.T, act func(*integration.ClusterV3, int64) error) {
-	clus := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 3})
+func testLeaseRemoveLeasedKey(t *testing.T, act func(*integration.Cluster, int64) error) {
+	clus := integration.NewCluster(t, &integration.ClusterConfig{Size: 3})
 	defer clus.Terminate(t)
 
 	leaseID, err := acquireLeaseAndKey(clus, "foo")
@@ -980,7 +1091,7 @@ func testLeaseRemoveLeasedKey(t *testing.T, act func(*integration.ClusterV3, int
 	}
 }
 
-func leaseExist(t *testing.T, clus *integration.ClusterV3, leaseID int64) bool {
+func leaseExist(t *testing.T, clus *integration.Cluster, leaseID int64) bool {
 	l := integration.ToGRPC(clus.RandClient()).Lease
 
 	_, err := l.LeaseGrant(context.Background(), &pb.LeaseGrantRequest{ID: leaseID, TTL: 5})

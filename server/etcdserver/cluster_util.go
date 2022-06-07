@@ -28,6 +28,7 @@ import (
 	"go.etcd.io/etcd/api/v3/version"
 	"go.etcd.io/etcd/client/pkg/v3/types"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/membership"
+	"go.etcd.io/etcd/server/v3/etcdserver/errors"
 
 	"github.com/coreos/go-semver/semver"
 	"go.uber.org/zap"
@@ -138,7 +139,7 @@ func getRemotePeerURLs(cl *membership.RaftCluster, local string) []string {
 // The key of the returned map is the member's ID. The value of the returned map
 // is the semver versions string, including server and cluster.
 // If it fails to get the version of a member, the key will be nil.
-func getMembersVersions(lg *zap.Logger, cl *membership.RaftCluster, local types.ID, rt http.RoundTripper) map[string]*version.Versions {
+func getMembersVersions(lg *zap.Logger, cl *membership.RaftCluster, local types.ID, rt http.RoundTripper, timeout time.Duration) map[string]*version.Versions {
 	members := cl.Members()
 	vers := make(map[string]*version.Versions)
 	for _, m := range members {
@@ -150,7 +151,7 @@ func getMembersVersions(lg *zap.Logger, cl *membership.RaftCluster, local types.
 			vers[m.ID.String()] = &version.Versions{Server: version.Version, Cluster: cv}
 			continue
 		}
-		ver, err := getVersion(lg, m, rt)
+		ver, err := getVersion(lg, m, rt, timeout)
 		if err != nil {
 			lg.Warn("failed to get version", zap.String("remote-member-id", m.ID.String()), zap.Error(err))
 			vers[m.ID.String()] = nil
@@ -183,9 +184,9 @@ func allowedVersionRange(downgradeEnabled bool) (minV *semver.Version, maxV *sem
 // cluster version in the range of [MinV, MaxV] and no known members has a cluster version
 // out of the range.
 // We set this rule since when the local member joins, another member might be offline.
-func isCompatibleWithCluster(lg *zap.Logger, cl *membership.RaftCluster, local types.ID, rt http.RoundTripper) bool {
-	vers := getMembersVersions(lg, cl, local, rt)
-	minV, maxV := allowedVersionRange(getDowngradeEnabledFromRemotePeers(lg, cl, local, rt))
+func isCompatibleWithCluster(lg *zap.Logger, cl *membership.RaftCluster, local types.ID, rt http.RoundTripper, timeout time.Duration) bool {
+	vers := getMembersVersions(lg, cl, local, rt, timeout)
+	minV, maxV := allowedVersionRange(getDowngradeEnabledFromRemotePeers(lg, cl, local, rt, timeout))
 	return isCompatibleWithVers(lg, vers, local, minV, maxV)
 }
 
@@ -234,9 +235,10 @@ func isCompatibleWithVers(lg *zap.Logger, vers map[string]*version.Versions, loc
 
 // getVersion returns the Versions of the given member via its
 // peerURLs. Returns the last error if it fails to get the version.
-func getVersion(lg *zap.Logger, m *membership.Member, rt http.RoundTripper) (*version.Versions, error) {
+func getVersion(lg *zap.Logger, m *membership.Member, rt http.RoundTripper, timeout time.Duration) (*version.Versions, error) {
 	cc := &http.Client{
 		Transport: rt,
+		Timeout:   timeout,
 	}
 	var (
 		err  error
@@ -303,12 +305,12 @@ func promoteMemberHTTP(ctx context.Context, url string, id uint64, peerRt http.R
 	}
 
 	if resp.StatusCode == http.StatusRequestTimeout {
-		return nil, ErrTimeout
+		return nil, errors.ErrTimeout
 	}
 	if resp.StatusCode == http.StatusPreconditionFailed {
 		// both ErrMemberNotLearner and ErrLearnerNotReady have same http status code
-		if strings.Contains(string(b), ErrLearnerNotReady.Error()) {
-			return nil, ErrLearnerNotReady
+		if strings.Contains(string(b), errors.ErrLearnerNotReady.Error()) {
+			return nil, errors.ErrLearnerNotReady
 		}
 		if strings.Contains(string(b), membership.ErrMemberNotLearner.Error()) {
 			return nil, membership.ErrMemberNotLearner
@@ -331,14 +333,14 @@ func promoteMemberHTTP(ctx context.Context, url string, id uint64, peerRt http.R
 }
 
 // getDowngradeEnabledFromRemotePeers will get the downgrade enabled status of the cluster.
-func getDowngradeEnabledFromRemotePeers(lg *zap.Logger, cl *membership.RaftCluster, local types.ID, rt http.RoundTripper) bool {
+func getDowngradeEnabledFromRemotePeers(lg *zap.Logger, cl *membership.RaftCluster, local types.ID, rt http.RoundTripper, timeout time.Duration) bool {
 	members := cl.Members()
 
 	for _, m := range members {
 		if m.ID == local {
 			continue
 		}
-		enable, err := getDowngradeEnabled(lg, m, rt)
+		enable, err := getDowngradeEnabled(lg, m, rt, timeout)
 		if err != nil {
 			lg.Warn("failed to get downgrade enabled status", zap.String("remote-member-id", m.ID.String()), zap.Error(err))
 		} else {
@@ -352,9 +354,10 @@ func getDowngradeEnabledFromRemotePeers(lg *zap.Logger, cl *membership.RaftClust
 
 // getDowngradeEnabled returns the downgrade enabled status of the given member
 // via its peerURLs. Returns the last error if it fails to get it.
-func getDowngradeEnabled(lg *zap.Logger, m *membership.Member, rt http.RoundTripper) (bool, error) {
+func getDowngradeEnabled(lg *zap.Logger, m *membership.Member, rt http.RoundTripper, timeout time.Duration) (bool, error) {
 	cc := &http.Client{
 		Transport: rt,
+		Timeout:   timeout,
 	}
 	var (
 		err  error
@@ -406,7 +409,7 @@ func convertToClusterVersion(v string) (*semver.Version, error) {
 		// allow input version format Major.Minor
 		ver, err = semver.NewVersion(v + ".0")
 		if err != nil {
-			return nil, ErrWrongDowngradeVersionFormat
+			return nil, errors.ErrWrongDowngradeVersionFormat
 		}
 	}
 	// cluster version only keeps major.minor, remove patch version

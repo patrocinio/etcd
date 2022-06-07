@@ -16,17 +16,20 @@ package schema
 
 import (
 	"encoding/binary"
+	"fmt"
+
+	"go.etcd.io/etcd/client/pkg/v3/verify"
 	"go.etcd.io/etcd/server/v3/storage/backend"
 )
 
-// UnsafeCreateMetaBucket creates the `meta` bucket (if it does not exists yet).
+// UnsafeCreateMetaBucket creates the `meta` bucket (if it does not exist yet).
 func UnsafeCreateMetaBucket(tx backend.BatchTx) {
 	tx.UnsafeCreateBucket(Meta)
 }
 
-// CreateMetaBucket creates the `meta` bucket (if it does not exists yet).
+// CreateMetaBucket creates the `meta` bucket (if it does not exist yet).
 func CreateMetaBucket(tx backend.BatchTx) {
-	tx.Lock()
+	tx.LockOutsideApply()
 	defer tx.Unlock()
 	tx.UnsafeCreateBucket(Meta)
 }
@@ -51,29 +54,36 @@ func UnsafeReadConsistentIndex(tx backend.ReadTx) (uint64, uint64) {
 // ReadConsistentIndex loads consistent index and term from given transaction.
 // returns 0 if the data are not found.
 func ReadConsistentIndex(tx backend.ReadTx) (uint64, uint64) {
-	tx.Lock()
-	defer tx.Unlock()
+	tx.RLock()
+	defer tx.RUnlock()
 	return UnsafeReadConsistentIndex(tx)
 }
 
-func UnsafeUpdateConsistentIndex(tx backend.BatchTx, index uint64, term uint64, onlyGrow bool) {
+func UnsafeUpdateConsistentIndexForce(tx backend.BatchTx, index uint64, term uint64) {
+	unsafeUpdateConsistentIndex(tx, index, term, true)
+}
+
+func UnsafeUpdateConsistentIndex(tx backend.BatchTx, index uint64, term uint64) {
+	unsafeUpdateConsistentIndex(tx, index, term, false)
+}
+
+func unsafeUpdateConsistentIndex(tx backend.BatchTx, index uint64, term uint64, allowDecreasing bool) {
 	if index == 0 {
-		// Never save 0 as it means that we didn't loaded the real index yet.
+		// Never save 0 as it means that we didn't load the real index yet.
 		return
 	}
-
-	if onlyGrow {
-		oldi, oldTerm := UnsafeReadConsistentIndex(tx)
-		if term < oldTerm {
-			return
-		}
-		if term == oldTerm && index <= oldi {
-			return
-		}
-	}
-
 	bs1 := make([]byte, 8)
 	binary.BigEndian.PutUint64(bs1, index)
+
+	if !allowDecreasing {
+		verify.Verify(func() {
+			previousIndex, _ := UnsafeReadConsistentIndex(tx)
+			if index < previousIndex {
+				panic(fmt.Errorf("update of consistent index not advancing: previous: %v new: %v", previousIndex, index))
+			}
+		})
+	}
+
 	// put the index into the underlying backend
 	// tx has been locked in TxnBegin, so there is no need to lock it again
 	tx.UnsafePut(Meta, MetaConsistentIndexKeyName, bs1)

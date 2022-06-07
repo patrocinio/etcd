@@ -27,6 +27,9 @@ import (
 	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/server/v3/auth"
 	"go.etcd.io/etcd/server/v3/etcdserver"
+	"go.etcd.io/etcd/server/v3/etcdserver/apply"
+	"go.etcd.io/etcd/server/v3/etcdserver/errors"
+	serverversion "go.etcd.io/etcd/server/v3/etcdserver/version"
 	"go.etcd.io/etcd/server/v3/storage/backend"
 	"go.etcd.io/etcd/server/v3/storage/mvcc"
 	"go.etcd.io/etcd/server/v3/storage/schema"
@@ -68,7 +71,7 @@ type ClusterStatusGetter interface {
 
 type maintenanceServer struct {
 	lg  *zap.Logger
-	rg  etcdserver.RaftStatusGetter
+	rg  apply.RaftStatusGetter
 	kg  KVGetter
 	bg  BackendGetter
 	a   Alarmer
@@ -76,10 +79,11 @@ type maintenanceServer struct {
 	hdr header
 	cs  ClusterStatusGetter
 	d   Downgrader
+	vs  serverversion.Server
 }
 
 func NewMaintenanceServer(s *etcdserver.EtcdServer) pb.MaintenanceServer {
-	srv := &maintenanceServer{lg: s.Cfg.Logger, rg: s, kg: s, bg: s, a: s, lt: s, hdr: newHeader(s), cs: s, d: s}
+	srv := &maintenanceServer{lg: s.Cfg.Logger, rg: s, kg: s, bg: s, a: s, lt: s, hdr: newHeader(s), cs: s, d: s, vs: etcdserver.NewServerVersionAdapter(s)}
 	if srv.lg == nil {
 		srv.lg = zap.NewNop()
 	}
@@ -182,7 +186,7 @@ func (ms *maintenanceServer) Snapshot(sr *pb.SnapshotRequest, srv pb.Maintenance
 	ms.lg.Info("successfully sent database snapshot to client",
 		zap.Int64("total-bytes", total),
 		zap.String("size", size),
-		zap.String("took", humanize.Time(start)),
+		zap.Duration("took", time.Since(start)),
 		zap.String("storage-version", storageVersion),
 	)
 	return nil
@@ -235,8 +239,11 @@ func (ms *maintenanceServer) Status(ctx context.Context, ar *pb.StatusRequest) (
 		DbSizeInUse:      ms.bg.Backend().SizeInUse(),
 		IsLearner:        ms.cs.IsLearner(),
 	}
+	if storageVersion := ms.vs.GetStorageVersion(); storageVersion != nil {
+		resp.StorageVersion = storageVersion.String()
+	}
 	if resp.Leader == raft.None {
-		resp.Errors = append(resp.Errors, etcdserver.ErrNoLeader.Error())
+		resp.Errors = append(resp.Errors, errors.ErrNoLeader.Error())
 	}
 	for _, a := range ms.a.Alarms() {
 		resp.Errors = append(resp.Errors, a.String())
@@ -245,7 +252,7 @@ func (ms *maintenanceServer) Status(ctx context.Context, ar *pb.StatusRequest) (
 }
 
 func (ms *maintenanceServer) MoveLeader(ctx context.Context, tr *pb.MoveLeaderRequest) (*pb.MoveLeaderResponse, error) {
-	if ms.rg.ID() != ms.rg.Leader() {
+	if ms.rg.MemberId() != ms.rg.Leader() {
 		return nil, rpctypes.ErrGRPCNotLeader
 	}
 

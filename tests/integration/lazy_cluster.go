@@ -43,7 +43,7 @@ type LazyCluster interface {
 	EndpointsV3() []string
 
 	// Cluster - calls to this method might initialize the cluster.
-	Cluster() *integration.ClusterV3
+	Cluster() *integration.Cluster
 
 	// Transport - call to this method might initialize the cluster.
 	Transport() *http.Transport
@@ -55,7 +55,7 @@ type LazyCluster interface {
 
 type lazyCluster struct {
 	cfg       integration.ClusterConfig
-	cluster   *integration.ClusterV3
+	cluster   *integration.Cluster
 	transport *http.Transport
 	once      sync.Once
 	tb        testutil.TB
@@ -77,12 +77,14 @@ func NewLazyClusterWithConfig(cfg integration.ClusterConfig) LazyCluster {
 
 func (lc *lazyCluster) mustLazyInit() {
 	lc.once.Do(func() {
+		lc.tb.Logf("LazyIniting ...")
 		var err error
 		lc.transport, err = transport.NewTransport(transport.TLSInfo{}, time.Second)
 		if err != nil {
 			log.Fatal(err)
 		}
-		lc.cluster = integration.NewClusterV3(lc.tb, &lc.cfg)
+		lc.cluster = integration.NewCluster(lc.tb, &lc.cfg)
+		lc.tb.Logf("LazyIniting [Done]")
 	})
 }
 
@@ -106,7 +108,7 @@ func (lc *lazyCluster) EndpointsV3() []string {
 	return lc.Cluster().Client(0).Endpoints()
 }
 
-func (lc *lazyCluster) Cluster() *integration.ClusterV3 {
+func (lc *lazyCluster) Cluster() *integration.Cluster {
 	lc.mustLazyInit()
 	return lc.cluster
 }

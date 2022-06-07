@@ -62,68 +62,6 @@ func (tr *storeTxnRead) Range(ctx context.Context, key, end []byte, ro RangeOpti
 	return tr.rangeKeys(ctx, key, end, tr.Rev(), ro)
 }
 
-func (tr *storeTxnRead) End() {
-	tr.tx.RUnlock() // RUnlock signals the end of concurrentReadTx.
-	tr.s.mu.RUnlock()
-}
-
-type storeTxnWrite struct {
-	storeTxnRead
-	tx backend.BatchTx
-	// beginRev is the revision where the txn begins; it will write to the next revision.
-	beginRev int64
-	changes  []mvccpb.KeyValue
-}
-
-func (s *store) Write(trace *traceutil.Trace) TxnWrite {
-	s.mu.RLock()
-	tx := s.b.BatchTx()
-	tx.Lock()
-	tw := &storeTxnWrite{
-		storeTxnRead: storeTxnRead{s, tx, 0, 0, trace},
-		tx:           tx,
-		beginRev:     s.currentRev,
-		changes:      make([]mvccpb.KeyValue, 0, 4),
-	}
-	return newMetricsTxnWrite(tw)
-}
-
-func (tw *storeTxnWrite) Rev() int64 { return tw.beginRev }
-
-func (tw *storeTxnWrite) Range(ctx context.Context, key, end []byte, ro RangeOptions) (r *RangeResult, err error) {
-	rev := tw.beginRev
-	if len(tw.changes) > 0 {
-		rev++
-	}
-	return tw.rangeKeys(ctx, key, end, rev, ro)
-}
-
-func (tw *storeTxnWrite) DeleteRange(key, end []byte) (int64, int64) {
-	if n := tw.deleteRange(key, end); n != 0 || len(tw.changes) > 0 {
-		return n, tw.beginRev + 1
-	}
-	return 0, tw.beginRev
-}
-
-func (tw *storeTxnWrite) Put(key, value []byte, lease lease.LeaseID) int64 {
-	tw.put(key, value, lease)
-	return tw.beginRev + 1
-}
-
-func (tw *storeTxnWrite) End() {
-	// only update index if the txn modifies the mvcc state.
-	if len(tw.changes) != 0 {
-		// hold revMu lock to prevent new read txns from opening until writeback.
-		tw.s.revMu.Lock()
-		tw.s.currentRev++
-	}
-	tw.tx.Unlock()
-	if len(tw.changes) != 0 {
-		tw.s.revMu.Unlock()
-	}
-	tw.s.mu.RUnlock()
-}
-
 func (tr *storeTxnRead) rangeKeys(ctx context.Context, key, end []byte, curRev int64, ro RangeOptions) (*RangeResult, error) {
 	rev := ro.Rev
 	if rev > curRev {
@@ -179,6 +117,68 @@ func (tr *storeTxnRead) rangeKeys(ctx context.Context, key, end []byte, curRev i
 	return &RangeResult{KVs: kvs, Count: total, Rev: curRev}, nil
 }
 
+func (tr *storeTxnRead) End() {
+	tr.tx.RUnlock() // RUnlock signals the end of concurrentReadTx.
+	tr.s.mu.RUnlock()
+}
+
+type storeTxnWrite struct {
+	storeTxnRead
+	tx backend.BatchTx
+	// beginRev is the revision where the txn begins; it will write to the next revision.
+	beginRev int64
+	changes  []mvccpb.KeyValue
+}
+
+func (s *store) Write(trace *traceutil.Trace) TxnWrite {
+	s.mu.RLock()
+	tx := s.b.BatchTx()
+	tx.LockInsideApply()
+	tw := &storeTxnWrite{
+		storeTxnRead: storeTxnRead{s, tx, 0, 0, trace},
+		tx:           tx,
+		beginRev:     s.currentRev,
+		changes:      make([]mvccpb.KeyValue, 0, 4),
+	}
+	return newMetricsTxnWrite(tw)
+}
+
+func (tw *storeTxnWrite) Rev() int64 { return tw.beginRev }
+
+func (tw *storeTxnWrite) Range(ctx context.Context, key, end []byte, ro RangeOptions) (r *RangeResult, err error) {
+	rev := tw.beginRev
+	if len(tw.changes) > 0 {
+		rev++
+	}
+	return tw.rangeKeys(ctx, key, end, rev, ro)
+}
+
+func (tw *storeTxnWrite) DeleteRange(key, end []byte) (int64, int64) {
+	if n := tw.deleteRange(key, end); n != 0 || len(tw.changes) > 0 {
+		return n, tw.beginRev + 1
+	}
+	return 0, tw.beginRev
+}
+
+func (tw *storeTxnWrite) Put(key, value []byte, lease lease.LeaseID) int64 {
+	tw.put(key, value, lease)
+	return tw.beginRev + 1
+}
+
+func (tw *storeTxnWrite) End() {
+	// only update index if the txn modifies the mvcc state.
+	if len(tw.changes) != 0 {
+		// hold revMu lock to prevent new read txns from opening until writeback.
+		tw.s.revMu.Lock()
+		tw.s.currentRev++
+	}
+	tw.tx.Unlock()
+	if len(tw.changes) != 0 {
+		tw.s.revMu.Unlock()
+	}
+	tw.s.mu.RUnlock()
+}
+
 func (tw *storeTxnWrite) put(key, value []byte, leaseID lease.LeaseID) {
 	rev := tw.beginRev + 1
 	c := rev
@@ -219,6 +219,11 @@ func (tw *storeTxnWrite) put(key, value []byte, leaseID lease.LeaseID) {
 	tw.s.kvindex.Put(key, idxRev)
 	tw.changes = append(tw.changes, kv)
 	tw.trace.Step("store kv pair into bolt db")
+
+	if oldLease == leaseID {
+		tw.trace.Step("attach lease to kv pair")
+		return
+	}
 
 	if oldLease != lease.NoLease {
 		if tw.s.le == nil {

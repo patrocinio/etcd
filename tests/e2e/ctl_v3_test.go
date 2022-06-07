@@ -145,9 +145,6 @@ type ctlCtx struct {
 	// for compaction
 	compactPhysical bool
 
-	// to run etcdutl instead of etcdctl for suitable commands.
-	etcdutl bool
-
 	// dir that was used during the test
 	dataDir string
 }
@@ -181,10 +178,6 @@ func withQuota(b int64) ctlOption {
 	return func(cx *ctlCtx) { cx.quotaBackendBytes = b }
 }
 
-func withCompactPhysical() ctlOption {
-	return func(cx *ctlCtx) { cx.compactPhysical = true }
-}
-
 func withInitialCorruptCheck() ctlOption {
 	return func(cx *ctlCtx) { cx.initialCorruptCheck = true }
 }
@@ -205,22 +198,22 @@ func withFlagByEnv() ctlOption {
 	return func(cx *ctlCtx) { cx.envMap = make(map[string]string) }
 }
 
-func withEtcdutl() ctlOption {
-	return func(cx *ctlCtx) { cx.etcdutl = true }
-}
-
 func testCtl(t *testing.T, testFunc func(ctlCtx), opts ...ctlOption) {
 	testCtlWithOffline(t, testFunc, nil, opts...)
+}
+
+func getDefaultCtlCtx(t *testing.T) ctlCtx {
+	return ctlCtx{
+		t:           t,
+		cfg:         *e2e.NewConfigAutoTLS(),
+		dialTimeout: 7 * time.Second,
+	}
 }
 
 func testCtlWithOffline(t *testing.T, testFunc func(ctlCtx), testOfflineFunc func(ctlCtx), opts ...ctlOption) {
 	e2e.BeforeTest(t)
 
-	ret := ctlCtx{
-		t:           t,
-		cfg:         *e2e.NewConfigAutoTLS(),
-		dialTimeout: 7 * time.Second,
-	}
+	ret := getDefaultCtlCtx(t)
 	ret.applyOpts(opts)
 
 	if !ret.quorum {
@@ -244,15 +237,19 @@ func testCtlWithOffline(t *testing.T, testFunc func(ctlCtx), testOfflineFunc fun
 	ret.epc = epc
 	ret.dataDir = epc.Procs[0].Config().DataDirPath
 
+	runCtlTest(t, testFunc, testOfflineFunc, ret)
+}
+
+func runCtlTest(t *testing.T, testFunc func(ctlCtx), testOfflineFunc func(ctlCtx), cx ctlCtx) {
 	defer func() {
-		if ret.envMap != nil {
-			for k := range ret.envMap {
+		if cx.envMap != nil {
+			for k := range cx.envMap {
 				os.Unsetenv(k)
 			}
-			ret.envMap = make(map[string]string)
+			cx.envMap = make(map[string]string)
 		}
-		if ret.epc != nil {
-			if errC := ret.epc.Close(); errC != nil {
+		if cx.epc != nil {
+			if errC := cx.epc.Close(); errC != nil {
 				t.Fatalf("error closing etcd processes (%v)", errC)
 			}
 		}
@@ -261,12 +258,12 @@ func testCtlWithOffline(t *testing.T, testFunc func(ctlCtx), testOfflineFunc fun
 	donec := make(chan struct{})
 	go func() {
 		defer close(donec)
-		testFunc(ret)
+		testFunc(cx)
 		t.Log("---testFunc logic DONE")
 	}()
 
-	timeout := 2*ret.dialTimeout + time.Second
-	if ret.dialTimeout == 0 {
+	timeout := 2*cx.dialTimeout + time.Second
+	if cx.dialTimeout == 0 {
 		timeout = 30 * time.Second
 	}
 	select {
@@ -276,12 +273,12 @@ func testCtlWithOffline(t *testing.T, testFunc func(ctlCtx), testOfflineFunc fun
 	}
 
 	t.Log("closing test cluster...")
-	assert.NoError(t, epc.Close())
-	epc = nil
+	assert.NoError(t, cx.epc.Close())
+	cx.epc = nil
 	t.Log("closed test cluster...")
 
 	if testOfflineFunc != nil {
-		testOfflineFunc(ret)
+		testOfflineFunc(cx)
 	}
 }
 
@@ -309,7 +306,7 @@ func (cx *ctlCtx) prefixArgs(eps []string) []string {
 
 	useEnv := cx.envMap != nil
 
-	cmdArgs := []string{e2e.CtlBinPath + "3"}
+	cmdArgs := []string{e2e.CtlBinPath}
 	for k, v := range fmap {
 		if useEnv {
 			ek := flags.FlagToEnv("ETCDCTL", k)
@@ -327,14 +324,10 @@ func (cx *ctlCtx) PrefixArgs() []string {
 	return cx.prefixArgs(cx.epc.EndpointsV3())
 }
 
-// PrefixArgsUtl returns prefix of the command that is either etcdctl or etcdutl
-// depending on cx configuration.
+// PrefixArgsUtl returns prefix of the command that is etcdutl
 // Please not thet 'utl' compatible commands does not consume --endpoints flag.
 func (cx *ctlCtx) PrefixArgsUtl() []string {
-	if cx.etcdutl {
-		return []string{e2e.UtlBinPath}
-	}
-	return []string{e2e.CtlBinPath}
+	return []string{e2e.UtlBinPath}
 }
 
 func isGRPCTimedout(err error) bool {

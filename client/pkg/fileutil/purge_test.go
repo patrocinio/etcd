@@ -22,21 +22,17 @@ import (
 	"testing"
 	"time"
 
-	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
 )
 
 func TestPurgeFile(t *testing.T) {
-	dir, err := os.MkdirTemp("", "purgefile")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	// minimal file set
 	for i := 0; i < 3; i++ {
 		f, ferr := os.Create(filepath.Join(dir, fmt.Sprintf("%d.test", i)))
 		if ferr != nil {
-			t.Fatal(err)
+			t.Fatal(ferr)
 		}
 		f.Close()
 	}
@@ -44,7 +40,7 @@ func TestPurgeFile(t *testing.T) {
 	stop, purgec := make(chan struct{}), make(chan string, 10)
 
 	// keep 3 most recent files
-	errch := purgeFile(zap.NewExample(), dir, "test", 3, time.Millisecond, stop, purgec, nil)
+	errch := purgeFile(zaptest.NewLogger(t), dir, "test", 3, time.Millisecond, stop, purgec, nil)
 	select {
 	case f := <-purgec:
 		t.Errorf("unexpected purge on %q", f)
@@ -56,7 +52,7 @@ func TestPurgeFile(t *testing.T) {
 		go func(n int) {
 			f, ferr := os.Create(filepath.Join(dir, fmt.Sprintf("%d.test", n)))
 			if ferr != nil {
-				t.Error(err)
+				t.Error(ferr)
 			}
 			f.Close()
 		}(i)
@@ -92,15 +88,11 @@ func TestPurgeFile(t *testing.T) {
 }
 
 func TestPurgeFileHoldingLockFile(t *testing.T) {
-	dir, err := os.MkdirTemp("", "purgefile")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	for i := 0; i < 10; i++ {
 		var f *os.File
-		f, err = os.Create(filepath.Join(dir, fmt.Sprintf("%d.test", i)))
+		f, err := os.Create(filepath.Join(dir, fmt.Sprintf("%d.test", i)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -115,7 +107,7 @@ func TestPurgeFileHoldingLockFile(t *testing.T) {
 	}
 
 	stop, purgec := make(chan struct{}), make(chan string, 10)
-	errch := purgeFile(zap.NewExample(), dir, "test", 3, time.Millisecond, stop, purgec, nil)
+	errch := purgeFile(zaptest.NewLogger(t), dir, "test", 3, time.Millisecond, stop, purgec, nil)
 
 	for i := 0; i < 5; i++ {
 		select {

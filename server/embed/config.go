@@ -15,6 +15,7 @@
 package embed
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -30,12 +31,14 @@ import (
 	"go.etcd.io/etcd/client/pkg/v3/tlsutil"
 	"go.etcd.io/etcd/client/pkg/v3/transport"
 	"go.etcd.io/etcd/client/pkg/v3/types"
+	"go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/pkg/v3/flags"
 	"go.etcd.io/etcd/pkg/v3/netutil"
 	"go.etcd.io/etcd/server/v3/config"
 	"go.etcd.io/etcd/server/v3/etcdserver"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/membership"
 	"go.etcd.io/etcd/server/v3/etcdserver/api/v3compactor"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/v3discovery"
 
 	bolt "go.etcd.io/bbolt"
 	"go.uber.org/multierr"
@@ -60,6 +63,12 @@ const (
 	DefaultGRPCKeepAliveInterval       = 2 * time.Hour
 	DefaultGRPCKeepAliveTimeout        = 20 * time.Second
 	DefaultDowngradeCheckTime          = 5 * time.Second
+	DefaultWaitClusterReadyTimeout     = 5 * time.Second
+
+	DefaultDiscoveryDialTimeout      = 2 * time.Second
+	DefaultDiscoveryRequestTimeOut   = 5 * time.Second
+	DefaultDiscoveryKeepAliveTime    = 2 * time.Second
+	DefaultDiscoveryKeepAliveTimeOut = 6 * time.Second
 
 	DefaultListenPeerURLs   = "http://localhost:2380"
 	DefaultListenClientURLs = "http://localhost:2379"
@@ -86,9 +95,6 @@ const (
 	// DefaultStrictReconfigCheck is the default value for "--strict-reconfig-check" flag.
 	// It's enabled by default.
 	DefaultStrictReconfigCheck = true
-	// DefaultEnableV2 is the default value for "--enable-v2" flag.
-	// v2 API is disabled by default.
-	DefaultEnableV2 = false
 
 	// maxElectionMs specifies the maximum value of election timeout.
 	// More details are listed in ../Documentation/tuning.md#time-parameters.
@@ -99,7 +105,7 @@ const (
 
 var (
 	ErrConflictBootstrapFlags = fmt.Errorf("multiple discovery or bootstrap flags are set. " +
-		"Choose one of \"initial-cluster\", \"discovery\" or \"discovery-srv\"")
+		"Choose one of \"initial-cluster\", \"discovery\", \"discovery-endpoints\" or \"discovery-srv\"")
 	ErrUnsetAdvertiseClientURLsFlag = fmt.Errorf("--advertise-client-urls is required when --listen-client-urls is set explicitly")
 	ErrLogRotationInvalidLogOutput  = fmt.Errorf("--log-outputs requires a single file path when --log-rotate-config-json is defined")
 
@@ -219,15 +225,14 @@ type Config struct {
 	DNSCluster            string `json:"discovery-srv"`
 	DNSClusterServiceName string `json:"discovery-srv-name"`
 	Dproxy                string `json:"discovery-proxy"`
-	Durl                  string `json:"discovery"`
-	InitialCluster        string `json:"initial-cluster"`
-	InitialClusterToken   string `json:"initial-cluster-token"`
-	StrictReconfigCheck   bool   `json:"strict-reconfig-check"`
 
-	// EnableV2 exposes the deprecated V2 API surface.
-	// TODO: Delete in 3.6 (https://github.com/etcd-io/etcd/issues/12913)
-	// Deprecated in 3.5.
-	EnableV2 bool `json:"enable-v2"`
+	Durl         string                      `json:"discovery"`
+	DiscoveryCfg v3discovery.DiscoveryConfig `json:"discovery-config"`
+
+	InitialCluster                      string        `json:"initial-cluster"`
+	InitialClusterToken                 string        `json:"initial-cluster-token"`
+	StrictReconfigCheck                 bool          `json:"strict-reconfig-check"`
+	ExperimentalWaitClusterReadyTimeout time.Duration `json:"wait-cluster-ready-timeout"`
 
 	// AutoCompactionMode is either 'periodic' or 'revision'.
 	AutoCompactionMode string `json:"auto-compaction-mode"`
@@ -311,10 +316,6 @@ type Config struct {
 
 	ExperimentalInitialCorruptCheck bool          `json:"experimental-initial-corrupt-check"`
 	ExperimentalCorruptCheckTime    time.Duration `json:"experimental-corrupt-check-time"`
-	// ExperimentalEnableV2V3 configures URLs that expose deprecated V2 API working on V3 store.
-	// Deprecated in v3.5.
-	// TODO: Delete in v3.6 (https://github.com/etcd-io/etcd/issues/12913)
-	ExperimentalEnableV2V3 string `json:"experimental-enable-v2v3"`
 	// ExperimentalEnableLeaseCheckpoint enables leader to send regular checkpoints to other members to prevent reset of remaining TTL on leader change.
 	ExperimentalEnableLeaseCheckpoint bool `json:"experimental-enable-lease-checkpoint"`
 	// ExperimentalEnableLeaseCheckpointPersist enables persisting remainingTTL to prevent indefinite auto-renewal of long lived leases. Always enabled in v3.6. Should be used to ensure smooth upgrade from v3.5 clusters with this feature enabled.
@@ -483,12 +484,12 @@ func NewConfig() *Config {
 		APUrls: []url.URL{*apurl},
 		ACUrls: []url.URL{*acurl},
 
-		ClusterState:        ClusterStateFlagNew,
-		InitialClusterToken: "etcd-cluster",
+		ClusterState:                        ClusterStateFlagNew,
+		InitialClusterToken:                 "etcd-cluster",
+		ExperimentalWaitClusterReadyTimeout: DefaultWaitClusterReadyTimeout,
 
 		StrictReconfigCheck: DefaultStrictReconfigCheck,
 		Metrics:             "basic",
-		EnableV2:            DefaultEnableV2,
 
 		CORS:          map[string]struct{}{"*": {}},
 		HostWhitelist: map[string]struct{}{"*": {}},
@@ -514,6 +515,18 @@ func NewConfig() *Config {
 		ExperimentalMaxLearners:                  membership.DefaultMaxLearners,
 
 		V2Deprecation: config.V2_DEPR_DEFAULT,
+
+		DiscoveryCfg: v3discovery.DiscoveryConfig{
+			ConfigSpec: clientv3.ConfigSpec{
+				DialTimeout:      DefaultDiscoveryDialTimeout,
+				RequestTimeout:   DefaultDiscoveryRequestTimeOut,
+				KeepAliveTime:    DefaultDiscoveryKeepAliveTime,
+				KeepAliveTimeout: DefaultDiscoveryKeepAliveTimeOut,
+
+				Secure: &clientv3.SecureConfig{},
+				Auth:   &clientv3.AuthConfig{},
+			},
+		},
 	}
 	cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
 	return cfg
@@ -595,8 +608,8 @@ func (cfg *configYAML) configFromFile(path string) error {
 		cfg.HostWhitelist = uv.Values
 	}
 
-	// If a discovery flag is set, clear default initial cluster set by InitialClusterFromName
-	if (cfg.Durl != "" || cfg.DNSCluster != "") && cfg.InitialCluster == defaultInitialCluster {
+	// If a discovery or discovery-endpoints flag is set, clear default initial cluster set by InitialClusterFromName
+	if (cfg.Durl != "" || cfg.DNSCluster != "" || len(cfg.DiscoveryCfg.Endpoints) > 0) && cfg.InitialCluster == defaultInitialCluster {
 		cfg.InitialCluster = ""
 	}
 	if cfg.ClusterState == "" {
@@ -663,7 +676,7 @@ func (cfg *Config) Validate() error {
 	}
 	// Check if conflicting flags are passed.
 	nSet := 0
-	for _, v := range []bool{cfg.Durl != "", cfg.InitialCluster != "", cfg.DNSCluster != ""} {
+	for _, v := range []bool{cfg.Durl != "", cfg.InitialCluster != "", cfg.DNSCluster != "", len(cfg.DiscoveryCfg.Endpoints) > 0} {
 		if v {
 			nSet++
 		}
@@ -675,6 +688,28 @@ func (cfg *Config) Validate() error {
 
 	if nSet > 1 {
 		return ErrConflictBootstrapFlags
+	}
+
+	// Check if both v2 discovery and v3 discovery flags are passed.
+	v2discoveryFlagsExist := cfg.Dproxy != ""
+	v3discoveryFlagsExist := len(cfg.DiscoveryCfg.Endpoints) > 0 ||
+		cfg.DiscoveryCfg.Token != "" ||
+		cfg.DiscoveryCfg.Secure.Cert != "" ||
+		cfg.DiscoveryCfg.Secure.Key != "" ||
+		cfg.DiscoveryCfg.Secure.Cacert != "" ||
+		cfg.DiscoveryCfg.Auth.Username != "" ||
+		cfg.DiscoveryCfg.Auth.Password != ""
+
+	if v2discoveryFlagsExist && v3discoveryFlagsExist {
+		return errors.New("both v2 discovery settings (discovery, discovery-proxy) " +
+			"and v3 discovery settings (discovery-token, discovery-endpoints, discovery-cert, " +
+			"discovery-key, discovery-cacert, discovery-user, discovery-password) are set")
+	}
+
+	// If one of `discovery-token` and `discovery-endpoints` is provided,
+	// then the other one must be provided as well.
+	if (cfg.DiscoveryCfg.Token != "") != (len(cfg.DiscoveryCfg.Endpoints) > 0) {
+		return errors.New("both --discovery-token and --discovery-endpoints must be set")
 	}
 
 	if cfg.TickMs == 0 {
@@ -726,10 +761,17 @@ func (cfg *Config) PeerURLsMapAndToken(which string) (urlsmap types.URLsMap, tok
 	switch {
 	case cfg.Durl != "":
 		urlsmap = types.URLsMap{}
-		// If using discovery, generate a temporary cluster based on
+		// If using v2 discovery, generate a temporary cluster based on
 		// self's advertised peer URLs
 		urlsmap[cfg.Name] = cfg.APUrls
 		token = cfg.Durl
+
+	case len(cfg.DiscoveryCfg.Endpoints) > 0:
+		urlsmap = types.URLsMap{}
+		// If using v3 discovery, generate a temporary cluster based on
+		// self's advertised peer URLs
+		urlsmap[cfg.Name] = cfg.APUrls
+		token = cfg.DiscoveryCfg.Token
 
 	case cfg.DNSCluster != "":
 		clusterStrs, cerr := cfg.GetDNSClusterNames()
