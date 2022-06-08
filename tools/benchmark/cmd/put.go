@@ -42,8 +42,9 @@ var putCmd = &cobra.Command{
 }
 
 var (
-	keySize int
-	valSize int
+	keySize    int
+	valSize    int
+	maxValSize int
 
 	putTotal int
 	putRate  int
@@ -60,7 +61,8 @@ var (
 func init() {
 	RootCmd.AddCommand(putCmd)
 	putCmd.Flags().IntVar(&keySize, "key-size", 8, "Key size of put request")
-	putCmd.Flags().IntVar(&valSize, "val-size", 8, "Value size of put request")
+	putCmd.Flags().IntVar(&valSize, "val-size", 8, "Value size of put request or minimum value size of put request if max-value-size flag is set to a positive value")
+	putCmd.Flags().IntVar(&maxValSize, "max-val-size", 0, "Maximum value size of put request")
 	putCmd.Flags().IntVar(&putRate, "rate", 0, "Maximum puts per second (0 is no limit)")
 
 	putCmd.Flags().IntVar(&putTotal, "total", 10000, "Total number of put requests")
@@ -77,13 +79,20 @@ func putFunc(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	if maxValSize == 0 {
+		maxValSize = valSize
+	} else if maxValSize < valSize {
+		fmt.Fprintf(os.Stderr, "expected --max-val-size (%v) equal or greater than --val-size (%v)", maxValSize, valSize)
+		os.Exit(1)
+	}
+
 	requests := make(chan v3.Op, totalClients)
 	if putRate == 0 {
 		putRate = math.MaxInt32
 	}
 	limit := rate.NewLimiter(rate.Limit(putRate), 1)
 	clients := mustCreateClients(totalClients, totalConns)
-	k, v := make([]byte, keySize), string(mustRandBytes(valSize))
+	k := make([]byte, keySize)
 
 	bar = pb.New(putTotal)
 	bar.Format("Bom !")
@@ -112,6 +121,8 @@ func putFunc(cmd *cobra.Command, args []string) {
 			} else {
 				binary.PutVarint(k, int64(rand.Intn(keySpaceSize)))
 			}
+			curValSize := rand.Intn(maxValSize+1-valSize) + valSize
+			v := string(mustRandBytes(curValSize))
 			requests <- v3.OpPut(string(k), v)
 		}
 		close(requests)
