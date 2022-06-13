@@ -25,6 +25,7 @@ import (
 
 	"github.com/coreos/go-semver/semver"
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.etcd.io/etcd/api/v3/version"
 	"go.etcd.io/etcd/server/v3/lease/leasepb"
 	"go.etcd.io/etcd/server/v3/storage/backend"
 	"go.etcd.io/etcd/server/v3/storage/schema"
@@ -36,8 +37,6 @@ const NoLease = LeaseID(0)
 
 // MaxLeaseTTL is the maximum lease TTL value
 const MaxLeaseTTL = 9000000000
-
-var v3_6 = semver.Version{Major: 3, Minor: 6}
 
 var (
 	forever = time.Time{}
@@ -286,15 +285,15 @@ func (le *lessor) Grant(id LeaseID, ttl int64) (*Lease, error) {
 		revokec: make(chan struct{}),
 	}
 
+	if l.ttl < le.minLeaseTTL {
+		l.ttl = le.minLeaseTTL
+	}
+
 	le.mu.Lock()
 	defer le.mu.Unlock()
 
 	if _, ok := le.leaseMap[id]; ok {
 		return nil, ErrLeaseExists
-	}
-
-	if l.ttl < le.minLeaseTTL {
-		l.ttl = le.minLeaseTTL
 	}
 
 	if le.isPrimary() {
@@ -326,6 +325,12 @@ func (le *lessor) Revoke(id LeaseID) error {
 		le.mu.Unlock()
 		return ErrLeaseNotFound
 	}
+
+	// We shouldn't delete the lease inside the transaction lock, otherwise
+	// it may lead to deadlock with Grant or Checkpoint operations, which
+	// acquire the le.mu firstly and then the batchTx lock.
+	delete(le.leaseMap, id)
+
 	defer close(l.revokec)
 	// unlock before doing external work
 	le.mu.Unlock()
@@ -344,9 +349,6 @@ func (le *lessor) Revoke(id LeaseID) error {
 		txn.DeleteRange([]byte(key), nil)
 	}
 
-	le.mu.Lock()
-	defer le.mu.Unlock()
-	delete(le.leaseMap, l.ID)
 	// lease deletion needs to be in the same backend transaction with the
 	// kv deletion. Or we might end up with not executing the revoke or not
 	// deleting the keys if etcdserver fails in between.
@@ -378,11 +380,11 @@ func (le *lessor) Checkpoint(id LeaseID, remainingTTL int64) error {
 
 func (le *lessor) shouldPersistCheckpoints() bool {
 	cv := le.cluster.Version()
-	return le.checkpointPersist || (cv != nil && greaterOrEqual(*cv, v3_6))
+	return le.checkpointPersist || (cv != nil && greaterOrEqual(*cv, version.V3_6))
 }
 
 func greaterOrEqual(first, second semver.Version) bool {
-	return !first.LessThan(second)
+	return !version.LessThan(first, second)
 }
 
 // Renew renews an existing lease. If the given lease does not exist or
